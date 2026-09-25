@@ -1,7 +1,7 @@
 name: Fac-Habitat Check
 on:
   schedule:
-    - cron: '*/55 * * * *'   # toutes les 15 min
+    - cron: '*/15 * * * *'   # toutes les 15 min
   workflow_dispatch:
 
 jobs:
