@@ -112,12 +112,12 @@ def format_prix_ligne(price: str) -> str:
 
 def send_telegram(message: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
+   payload = {
+          "chat_id": TELEGRAM_CHAT_ID,
+          "text": message,
+          "parse_mode": "HTML",
+          "disable_notification": silent,   # ← ajouter cette ligne
+      }
     try:
         r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
@@ -304,6 +304,14 @@ def scrape_crous(url: str) -> dict:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def check_all() -> None:
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+    # Heartbeat silencieux — désactive avec disable_notification: True
+    send_telegram(
+        f"🤖 <b>Run démarré</b> — {now}\n"
+        f"💶 Filtre : ≤ {PRIX_MAX_EUROS}€",
+        silent=True   # notif muette, pas de son
+    )
     state     = load_state()
     now       = datetime.now().strftime("%d/%m/%Y %H:%M")
     new_state = dict(state)
