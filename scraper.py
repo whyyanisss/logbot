@@ -32,7 +32,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "TON_CHAT_ID")
 PRIX_MAX_EUROS = 600
 
 # ── Sources à surveiller ───────────────────────────────────────
-# Fac-Habitat / Smerra : villes à surveiller
 FAC_HABITAT_PAGES = [
     "https://logement.smerra.fr/ville/paris/",
     "https://logement.smerra.fr/ville/aubervilliers/",
@@ -40,8 +39,6 @@ FAC_HABITAT_PAGES = [
     "https://logement.smerra.fr/ville/evry-courcouronnes/",
 ]
 
-# CROUS : URL de recherche Île-de-France, triée par prix croissant
-# L'API accepte city=Paris et les pages se paginent avec ?page=N
 CROUS_SEARCH_PAGES = [
     "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris",
     "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris&page=2",
@@ -49,7 +46,7 @@ CROUS_SEARCH_PAGES = [
     "https://trouverunlogement.lescrous.fr/tools/47/search?city=Creteil",
 ]
 
-# ── Technique ─────────────────────────────────────────────────
+# ── Technique ──────────────────────────────────────────────────
 STATE_FILE = Path(__file__).parent / "state.json"
 HEADERS = {
     "User-Agent": (
@@ -71,14 +68,11 @@ def extract_prix_min(text: str) -> float | None:
       "403,59 €"             → 403.59
     Retourne None si aucun nombre trouvé.
     """
-    # Tous les nombres avec virgule ou point dans le texte
     nombres = re.findall(r"\d[\d\s]*[,\.]\d{2}", text.replace("\xa0", ""))
     if not nombres:
-        # Entiers simples
         nombres = re.findall(r"\d{3,}", text)
     if not nombres:
         return None
-    # On prend le plus petit (= loyer minimum)
     valeurs = []
     for n in nombres:
         try:
@@ -101,27 +95,29 @@ def prix_ok(prix_str: str) -> bool:
 def format_prix_ligne(price: str) -> str:
     """
     Formate la ligne prix pour le message Telegram.
-    - Prix connu et sous le seuil  → "💶 À partir de 465€ (≤ 600€)"
-    - Prix inconnu / non parseable → "💶 ⚠️ Prix non récupéré — vérifier sur le site"
+    - Prix connu sous le seuil  → "💶 À partir de 465€ (≤ 600€)"
+    - Prix inconnu/non parseable → "💶 ⚠️ Prix non récupéré — vérifier sur le site"
     """
     p = extract_prix_min(price) if price not in ("N/A", "", None) else None
     if p is None:
-        return f"💶 ⚠️ Prix non récupéré — vérifier sur le site"
+        return "💶 ⚠️ Prix non récupéré — vérifier sur le site"
     return f"💶 {price} (≤ {PRIX_MAX_EUROS}€)"
 
 
-def send_telegram(message: str) -> None:
+# BUG 1 corrigé : ajout du paramètre silent=False manquant dans la signature
+def send_telegram(message: str, silent: bool = False) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
-          "chat_id": TELEGRAM_CHAT_ID,
-          "text": message,
-          "parse_mode": "HTML",
-          "disable_notification": silent,   # ← ajouter cette ligne
-      }
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+        "disable_notification": silent,
+    }
     try:
         r = requests.post(url, json=payload, timeout=10)
         r.raise_for_status()
-        print("  [Telegram] ✓ Message envoyé")
+        print("  [Telegram] ✓ Message envoyé" + (" (silencieux)" if silent else ""))
     except Exception as e:
         print(f"  [Telegram] ✗ Erreur : {e}")
 
@@ -155,10 +151,6 @@ def parse_status_fh(text: str) -> str:
 
 
 def scrape_fac_habitat(url: str) -> dict:
-    """
-    Scrape une page ville Smerra/Fac-Habitat.
-    Retourne { "fh:<slug>" : { name, url, price, status, source } }
-    """
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -175,7 +167,6 @@ def scrape_fac_habitat(url: str) -> dict:
             continue
         seen.add(slug)
 
-        # Remonter jusqu'au conteneur portant un statut
         container = link
         for _ in range(4):
             container = container.parent
@@ -187,7 +178,6 @@ def scrape_fac_habitat(url: str) -> dict:
         if container is None:
             continue
 
-        # Nom
         name_el = (
             link.find(["h2", "h3", "h4", "strong"])
             or container.find(["h2", "h3", "h4", "strong"])
@@ -196,7 +186,6 @@ def scrape_fac_habitat(url: str) -> dict:
         if len(name) < 4:
             continue
 
-        # Prix
         price = "N/A"
         for el in container.find_all(string=True):
             t = el.strip()
@@ -204,7 +193,6 @@ def scrape_fac_habitat(url: str) -> dict:
                 price = t
                 break
 
-        # Statut
         status_raw = ""
         for el in container.find_all(string=True):
             t = el.strip()
@@ -232,30 +220,22 @@ def scrape_fac_habitat(url: str) -> dict:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def scrape_crous(url: str) -> dict:
-    """
-    Scrape une page de résultats trouverunlogement.lescrous.fr.
-    Les logements listés sont tous disponibles (le site ne montre que le dispo).
-    Retourne { "crous:<id>" : { name, url, price, status, source } }
-    """
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
     residences = {}
 
-    # Chaque logement est dans un <li> avec un lien vers /tools/47/accommodations/<id>
     for link in soup.find_all("a", href=True):
         href = link["href"]
         if "/accommodations/" not in href:
             continue
 
-        # ID unique
         accom_id = href.rstrip("/").split("/")[-1]
         key = f"crous:{accom_id}"
         if key in residences:
             continue
 
-        # Nom (balise h3 dans le lien ou son parent)
         name_el = link.find("h3") or link.find("h2") or link.find("strong")
         if name_el is None:
             parent = link.parent
@@ -263,7 +243,6 @@ def scrape_crous(url: str) -> dict:
         name = name_el.get_text(strip=True) if name_el else f"Résidence CROUS #{accom_id}"
         name = name[:120]
 
-        # Prix : cherche dans le conteneur parent
         container = link.parent or link
         price = "N/A"
         for el in container.find_all(string=True):
@@ -272,11 +251,9 @@ def scrape_crous(url: str) -> dict:
                 price = t
                 break
 
-        # Adresse (optionnel, pour enrichir la notif)
         addr = ""
         for el in container.find_all(string=True):
             t = el.strip()
-            # Cherche une chaîne qui ressemble à une adresse (numéro + rue)
             if re.match(r"^\d+[,\s]", t) and len(t) > 10:
                 addr = t
                 break
@@ -286,7 +263,6 @@ def scrape_crous(url: str) -> dict:
             else "https://trouverunlogement.lescrous.fr" + href
         )
 
-        # Les logements listés sur le CROUS sont toujours disponibles
         residences[key] = {
             "name": name,
             "url": full_url,
@@ -304,16 +280,18 @@ def scrape_crous(url: str) -> dict:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def check_all() -> None:
+    # BUG 2 corrigé : now défini une seule fois ici (il était défini deux fois,
+    # la 2e fois APRÈS le heartbeat qui l'utilisait déjà)
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    # Heartbeat silencieux — désactive avec disable_notification: True
+    # Heartbeat silencieux : confirme que le bot tourne, sans son
     send_telegram(
         f"🤖 <b>Run démarré</b> — {now}\n"
-        f"💶 Filtre : ≤ {PRIX_MAX_EUROS}€",
-        silent=True   # notif muette, pas de son
+        f"💶 Filtre actif : ≤ {PRIX_MAX_EUROS}€",
+        silent=True,
     )
+
     state     = load_state()
-    now       = datetime.now().strftime("%d/%m/%Y %H:%M")
     new_state = dict(state)
     alerts    = []
 
@@ -329,16 +307,15 @@ def check_all() -> None:
         print(f"  {len(residences)} résidence(s) trouvée(s)")
 
         for key, info in residences.items():
-            prev  = state.get(key, {})
+            prev        = state.get(key, {})
             prev_status = prev.get("status", "unknown")
             curr_status = info["status"]
             new_state[key] = info
 
-            icon = {"available":"✅","coming_soon":"⏳","full":"🔴","unknown":"❓"}
-            prix_filtre = f"{'✓' if prix_ok(info['price']) else '✗ hors budget'}"
+            icon = {"available": "✅", "coming_soon": "⏳", "full": "🔴", "unknown": "❓"}
+            prix_filtre = "✓" if prix_ok(info["price"]) else "✗ hors budget"
             print(f"  {icon.get(curr_status,'?')} {info['name']} | {info['price']} {prix_filtre}")
 
-            # Alerte seulement si le prix passe le filtre
             if not prix_ok(info["price"]):
                 continue
 
@@ -371,18 +348,16 @@ def check_all() -> None:
         print(f"  {len(residences)} logement(s) trouvé(s)")
 
         for key, info in residences.items():
-            prev = state.get(key, {})
+            prev        = state.get(key, {})
             prev_status = prev.get("status", "unknown")
             new_state[key] = info
 
-            prix_filtre = f"{'✓' if prix_ok(info['price']) else '✗ hors budget'}"
+            prix_filtre = "✓" if prix_ok(info["price"]) else "✗ hors budget"
             print(f"  ✅ {info['name']} | {info['price']} {prix_filtre}")
 
-            # Filtre prix
             if not prix_ok(info["price"]):
                 continue
 
-            # Alerte seulement si c'est un nouveau logement jamais vu
             if prev_status == "unknown":
                 addr_line = f"\n📮 {info['address']}" if info.get("address") else ""
                 alerts.append(
