@@ -33,6 +33,7 @@ PRIX_MAX_EUROS = 600
 
 # ── Sources à surveiller ───────────────────────────────────────
 FAC_HABITAT_PAGES = [
+    "https://logement.smerra.fr/ville/paris/?availability=immediat%2Ca-venir&language=fr",
     "https://logement.smerra.fr/ville/paris/",
     "https://logement.smerra.fr/ville/aubervilliers/",
     "https://logement.smerra.fr/ville/massy/",
