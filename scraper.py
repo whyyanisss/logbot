@@ -112,7 +112,7 @@ def format_prix_ligne(price: str) -> str:
 
 def send_telegram(message: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-   payload = {
+    payload = {
           "chat_id": TELEGRAM_CHAT_ID,
           "text": message,
           "parse_mode": "HTML",
