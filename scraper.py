@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Surveillant de logements étudiants — Fac-Habitat + CROUS Île-de-France
-Envoie une alerte Telegram dès qu'un logement disponible passe sous le seuil de prix.
+Envoie une alerte Telegram pour tout logement disponible ou à venir
+autour de Paris, priorité Val-de-Marne (94).
 
 Usage :
   python scraper.py                  # une seule vérification
@@ -26,25 +27,52 @@ from bs4 import BeautifulSoup
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "TON_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "TON_CHAT_ID")
 
-# ── Filtre de prix ─────────────────────────────────────────────
-# Seuls les logements dont le loyer minimum est <= cette valeur
-# déclenchent une alerte. Modifie uniquement cette ligne.
-PRIX_MAX_EUROS = 600
-
 # ── Sources à surveiller ───────────────────────────────────────
+# Val-de-Marne (94) en priorité, puis petite couronne et Paris
 FAC_HABITAT_PAGES = [
-    "https://logement.smerra.fr/ville/paris/?availability=immediat%2Ca-venir&language=fr",
+    # ── 94 Val-de-Marne ───────────────────────────────────────
+    "https://logement.smerra.fr/ville/creteil/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/ivry-sur-seine/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/vitry-sur-seine/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/alfortville/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/villejuif/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/maisons-alfort/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/vincennes/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/saint-maur-des-fosses/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/fontenay-sous-bois/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/champigny-sur-marne/?availability=immediat%2Ca-venir&language=fr",
+    # ── 93 Seine-Saint-Denis ──────────────────────────────────
     "https://logement.smerra.fr/ville/aubervilliers/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/saint-denis/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/montreuil/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/pantin/?availability=immediat%2Ca-venir&language=fr",
+    # ── 92 Hauts-de-Seine ─────────────────────────────────────
+    "https://logement.smerra.fr/ville/boulogne-billancourt/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/nanterre/?availability=immediat%2Ca-venir&language=fr",
+    "https://logement.smerra.fr/ville/issy-les-moulineaux/?availability=immediat%2Ca-venir&language=fr",
+    # ── 91 Essonne ────────────────────────────────────────────
     "https://logement.smerra.fr/ville/massy/?availability=immediat%2Ca-venir&language=fr",
     "https://logement.smerra.fr/ville/evry-courcouronnes/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/villejuif/?availability=immediat%2Ca-venir&language=fr"
+    # ── Paris ─────────────────────────────────────────────────
+    "https://logement.smerra.fr/ville/paris/?availability=immediat%2Ca-venir&language=fr",
 ]
 
 CROUS_SEARCH_PAGES = [
+    # ── 94 Val-de-Marne ───────────────────────────────────────
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Creteil",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Creteil&page=2",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Ivry-sur-Seine",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Vitry-sur-Seine",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Villejuif",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Vincennes",
+    # ── Paris ─────────────────────────────────────────────────
     "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris",
     "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris&page=2",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris&page=3",
+    # ── Versailles / autres ───────────────────────────────────
     "https://trouverunlogement.lescrous.fr/tools/47/search?city=Versailles",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Creteil",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Nanterre",
+    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Massy",
 ]
 
 # ── Technique ──────────────────────────────────────────────────
@@ -61,51 +89,14 @@ HEADERS = {
 # ║                      UTILITAIRES                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def extract_prix_min(text: str) -> float | None:
-    """
-    Extrait le prix minimum depuis une chaîne comme :
-      "À partir de 548,88€"  → 548.88
-      "de 323,31 à 646,61 €" → 323.31
-      "403,59 €"             → 403.59
-    Retourne None si aucun nombre trouvé.
-    """
-    nombres = re.findall(r"\d[\d\s]*[,\.]\d{2}", text.replace("\xa0", ""))
-    if not nombres:
-        nombres = re.findall(r"\d{3,}", text)
-    if not nombres:
-        return None
-    valeurs = []
-    for n in nombres:
-        try:
-            valeurs.append(float(n.replace(" ", "").replace(",", ".")))
-        except ValueError:
-            pass
-    return min(valeurs) if valeurs else None
+def extract_prix(text: str) -> str:
+    """Retourne la chaîne prix nettoyée, ou 'N/A'."""
+    t = text.strip()
+    if not t or "€" not in t:
+        return "N/A"
+    return t
 
 
-def prix_ok(prix_str: str) -> bool:
-    """Retourne True si le prix minimum extrait est <= PRIX_MAX_EUROS."""
-    if prix_str in ("N/A", "", None):
-        return True  # prix inconnu → on alerte quand même
-    p = extract_prix_min(prix_str)
-    if p is None:
-        return True
-    return p <= PRIX_MAX_EUROS
-
-
-def format_prix_ligne(price: str) -> str:
-    """
-    Formate la ligne prix pour le message Telegram.
-    - Prix connu sous le seuil  → "💶 À partir de 465€ (≤ 600€)"
-    - Prix inconnu/non parseable → "💶 ⚠️ Prix non récupéré — vérifier sur le site"
-    """
-    p = extract_prix_min(price) if price not in ("N/A", "", None) else None
-    if p is None:
-        return "💶 ⚠️ Prix non récupéré — vérifier sur le site"
-    return f"💶 {price} (≤ {PRIX_MAX_EUROS}€)"
-
-
-# BUG 1 corrigé : ajout du paramètre silent=False manquant dans la signature
 def send_telegram(message: str, silent: bool = False) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -190,7 +181,7 @@ def scrape_fac_habitat(url: str) -> dict:
         price = "N/A"
         for el in container.find_all(string=True):
             t = el.strip()
-            if "€" in t and "partir" in t.lower():
+            if "€" in t:
                 price = t
                 break
 
@@ -281,14 +272,11 @@ def scrape_crous(url: str) -> dict:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def check_all() -> None:
-    # BUG 2 corrigé : now défini une seule fois ici (il était défini deux fois,
-    # la 2e fois APRÈS le heartbeat qui l'utilisait déjà)
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    # Heartbeat silencieux : confirme que le bot tourne, sans son
     send_telegram(
         f"🤖 <b>Run démarré</b> — {now}\n"
-        f"💶 Filtre actif : ≤ {PRIX_MAX_EUROS}€",
+        f"📍 Surveillance IDF (94 prioritaire)",
         silent=True,
     )
 
@@ -314,28 +302,20 @@ def check_all() -> None:
             new_state[key] = info
 
             icon = {"available": "✅", "coming_soon": "⏳", "full": "🔴", "unknown": "❓"}
-            prix_filtre = "✓" if prix_ok(info["price"]) else "✗ hors budget"
-            print(f"  {icon.get(curr_status,'?')} {info['name']} | {info['price']} {prix_filtre}")
+            print(f"  {icon.get(curr_status,'?')} {info['name']} | {info['price']}")
 
-            if not prix_ok(info["price"]):
-                continue
-
-            if curr_status in ("available", "coming_soon") and prev_status == "full":
-                emoji = "🟢" if curr_status == "available" else "🟡"
-                label = "DISPONIBLE MAINTENANT !" if curr_status == "available" else "BIENTÔT DISPONIBLE"
-                alerts.append(
-                    f"{emoji} <b>[Fac-Habitat] {label}</b>\n"
-                    f"📍 {info['name']}\n"
-                    f"{format_prix_ligne(info['price'])}\n"
-                    f"🔗 <a href=\"{info['url']}\">Voir la résidence</a>"
-                )
-            elif curr_status == "available" and prev_status == "unknown":
-                alerts.append(
-                    f"🆕 <b>[Fac-Habitat] NOUVEAU LOGEMENT DISPONIBLE</b>\n"
-                    f"📍 {info['name']}\n"
-                    f"{format_prix_ligne(info['price'])}\n"
-                    f"🔗 <a href=\"{info['url']}\">Voir la résidence</a>"
-                )
+            # Alerte si le logement n'est pas complet
+            if curr_status in ("available", "coming_soon"):
+                if prev_status == "full" or prev_status == "unknown":
+                    emoji = "🟢" if curr_status == "available" else "🟡"
+                    label = "DISPONIBLE MAINTENANT !" if curr_status == "available" else "BIENTÔT DISPONIBLE"
+                    prix_line = f"💶 {info['price']}" if info["price"] != "N/A" else "💶 Prix non renseigné"
+                    alerts.append(
+                        f"{emoji} <b>[Fac-Habitat] {label}</b>\n"
+                        f"📍 {info['name']}\n"
+                        f"{prix_line}\n"
+                        f"🔗 <a href=\"{info['url']}\">Voir la résidence</a>"
+                    )
 
     # ── CROUS ─────────────────────────────────────────────────
     for page_url in CROUS_SEARCH_PAGES:
@@ -353,32 +333,26 @@ def check_all() -> None:
             prev_status = prev.get("status", "unknown")
             new_state[key] = info
 
-            prix_filtre = "✓" if prix_ok(info["price"]) else "✗ hors budget"
-            print(f"  ✅ {info['name']} | {info['price']} {prix_filtre}")
-
-            if not prix_ok(info["price"]):
-                continue
+            prix_line = f"💶 {info['price']}" if info["price"] != "N/A" else "💶 Prix non renseigné"
+            print(f"  ✅ {info['name']} | {info['price']}")
 
             if prev_status == "unknown":
                 addr_line = f"\n📮 {info['address']}" if info.get("address") else ""
                 alerts.append(
                     f"🏛️ <b>[CROUS] NOUVEAU LOGEMENT DISPONIBLE</b>\n"
                     f"📍 {info['name']}{addr_line}\n"
-                    f"{format_prix_ligne(info['price'])}\n"
+                    f"{prix_line}\n"
                     f"🔗 <a href=\"{info['url']}\">Voir le logement</a>"
                 )
 
     save_state(new_state)
 
     if alerts:
-        header = (
-            f"🏠 <b>Alerte logement étudiant</b> ({now})\n"
-            f"💶 Filtre actif : loyer ≤ {PRIX_MAX_EUROS}€\n\n"
-        )
+        header = f"🏠 <b>Alerte logement étudiant IDF</b> ({now})\n\n"
         send_telegram(header + "\n\n".join(alerts))
         print(f"\n→ {len(alerts)} alerte(s) Telegram envoyée(s) !")
     else:
-        print(f"\n[{now}] Aucun nouveau logement sous {PRIX_MAX_EUROS}€.")
+        print(f"\n[{now}] Aucun nouveau logement détecté.")
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -387,7 +361,7 @@ def check_all() -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description=f"Surveille Fac-Habitat + CROUS IDF (filtre ≤ {PRIX_MAX_EUROS}€)"
+        description="Surveille Fac-Habitat + CROUS IDF (94 prioritaire, sans filtre de prix)"
     )
     parser.add_argument(
         "--loop", type=int, default=0, metavar="MINUTES",
@@ -395,8 +369,9 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"🔍 Démarrage — filtre prix : ≤ {PRIX_MAX_EUROS}€/mois")
-    print(f"   Sources : Fac-Habitat ({len(FAC_HABITAT_PAGES)} pages) + CROUS ({len(CROUS_SEARCH_PAGES)} pages)\n")
+    total = len(FAC_HABITAT_PAGES) + len(CROUS_SEARCH_PAGES)
+    print(f"🔍 Démarrage — aucun filtre de prix")
+    print(f"   Sources : Fac-Habitat ({len(FAC_HABITAT_PAGES)} pages) + CROUS ({len(CROUS_SEARCH_PAGES)} pages) = {total} pages\n")
 
     if args.loop > 0:
         print(f"🔄 Boucle : toutes les {args.loop} min. Ctrl+C pour arrêter.\n")
