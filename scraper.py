@@ -55,6 +55,14 @@ FAC_HABITAT_PAGES = [f"https://logement.smerra.fr/ville/{c}/{FH_SUFFIX}" for c i
 CROUS_SEARCH_URL = "https://trouverunlogement.lescrous.fr/tools/47/search"
 IDF_DEPTS = ("75", "77", "78", "91", "92", "93", "94", "95")
 
+# ── Résidences à surveiller en priorité ────────────────────────
+# Clé = fin de l'URL de la résidence (…/residence-etudiante/<slug>/).
+# Alerte dédiée à CHAQUE changement de statut (à venir → dispo, dispo → complet…).
+WATCHLIST = {
+    "fac-habitat-alice-guy": "Résidence Alice Guy — 2 Rue Paul Bert, Saint-Mandé",
+}
+WATCH_KEYS = {f"fh:{slug}" for slug in WATCHLIST}
+
 STATE_FILE = Path(__file__).parent / "state.json"
 DEBUG_DIR = Path(__file__).parent / "debug"
 HEADERS = {
@@ -87,6 +95,24 @@ def format_prix_ligne(price: str) -> str:
 
 def addr_line(info: dict) -> str:
     return f"\n📮 {html.escape(info['address'])}" if info.get("address") else ""
+
+
+def watch_message(info: dict, prev: str, curr: str) -> str:
+    labels = {"available": "dispo immédiate", "coming_soon": "dispo à venir",
+              "full": "complet", "unknown": "inconnu", "gone": "absent des listes"}
+    if curr == "available":
+        head = "🟢🚨 <b>DISPONIBLE MAINTENANT !</b>"
+    elif curr == "coming_soon":
+        head = "🟡 <b>Passe en « Dispo à venir »</b>"
+    else:
+        head = f"ℹ️ <b>Statut : {labels.get(curr, curr)}</b>"
+    return (
+        f"{head}\n"
+        f"📍 {html.escape(info['name'])}{addr_line(info)}\n"
+        f"{format_prix_ligne(info['price'])}\n"
+        f"(avant : {labels.get(prev, prev)})\n"
+        f"🔗 <a href=\"{html.escape(info['url'])}\">Voir la résidence</a>"
+    )
 
 
 def send_telegram(message: str, silent: bool = False) -> None:
@@ -323,6 +349,7 @@ def check_all() -> None:
     state = load_state()
     seen: dict = {}          # tout ce qui a été vu pendant ce run
     alerts: list = []
+    watch_alerts: list = []
     alerted: set = set()
     all_ok = True            # False si au moins une page a échoué
     counts = {"Fac-Habitat": 0, "CROUS": 0}
@@ -347,7 +374,11 @@ def check_all() -> None:
             seen[key] = info
             print(f"  {ICON.get(curr_status, '?')} {info['name']} | {curr_status} | {info['price']}")
 
-            if (
+            if key in WATCH_KEYS:
+                if prev_status != curr_status and key not in alerted:
+                    alerted.add(key)
+                    watch_alerts.append(watch_message(info, prev_status, curr_status))
+            elif (
                 curr_status in ("available", "coming_soon")
                 and prev_status not in ("available", "coming_soon")
                 and key not in alerted
@@ -389,6 +420,13 @@ def check_all() -> None:
         all_ok = False
 
     # ── Mise à jour de l'état ─────────────────────────────────
+    gone_watch = []
+    if all_ok:
+        for wk in WATCH_KEYS:
+            prev = state.get(wk)
+            if wk not in seen and prev and prev.get("status") != "gone":
+                gone_watch.append(wk)
+
     if all_ok:
         # Tout a été scrapé : on ne garde que ce qui est encore visible,
         # ainsi un logement qui disparaît puis revient re-déclenche une alerte.
@@ -396,7 +434,14 @@ def check_all() -> None:
     else:
         # Une page a échoué : on conserve l'ancien état pour éviter de fausses alertes
         new_state = {**state, **seen}
+    for wk in gone_watch:
+        new_state[wk] = {**state[wk], "status": "gone"}
+        watch_alerts.append(watch_message(state[wk], state[wk].get("status", "unknown"), "gone"))
     save_state(new_state)
+
+    if watch_alerts:
+        send_alerts("🚨 <b>RÉSIDENCE SURVEILLÉE</b>\n\n", watch_alerts)
+        print(f"\n→ {len(watch_alerts)} alerte(s) résidence surveillée envoyée(s) !")
 
     # ── Alertes ───────────────────────────────────────────────
     if alerts:
