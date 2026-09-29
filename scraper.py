@@ -4,13 +4,17 @@ Surveillant de logements étudiants — Fac-Habitat + CROUS Île-de-France
 Envoie une alerte Telegram dès qu'un logement disponible apparaît.
 
 Usage :
-  python scraper.py                  # une seule vérification
-  python scraper.py --loop 15        # boucle toutes les 15 minutes
+  python scraper.py                 # une seule vérification
+  python scraper.py --loop 15       # boucle toutes les 15 minutes
+  python scraper.py --reset         # efface state.json avant de commencer
+  python scraper.py --debug         # sauvegarde le HTML des pages à 0 résultat
 """
 
 import argparse
+import html
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime
@@ -26,72 +30,67 @@ from bs4 import BeautifulSoup
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "TON_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "TON_CHAT_ID")
 
-# ── Sources à surveiller ───────────────────────────────────────
-# Val-de-Marne (94) en priorité, puis petite couronne et Paris
-FAC_HABITAT_PAGES = [
-    # ── 94 Val-de-Marne ───────────────────────────────────────
-    "https://logement.smerra.fr/ville/creteil/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/ivry-sur-seine/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/vitry-sur-seine/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/alfortville/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/villejuif/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/maisons-alfort/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/vincennes/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/saint-maur-des-fosses/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/fontenay-sous-bois/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/champigny-sur-marne/?availability=immediat%2Ca-venir&language=fr",
-    # ── 93 Seine-Saint-Denis ──────────────────────────────────
-    "https://logement.smerra.fr/ville/aubervilliers/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/saint-denis/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/montreuil/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/pantin/?availability=immediat%2Ca-venir&language=fr",
-    # ── 92 Hauts-de-Seine ─────────────────────────────────────
-    "https://logement.smerra.fr/ville/boulogne-billancourt/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/nanterre/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/issy-les-moulineaux/?availability=immediat%2Ca-venir&language=fr",
-    # ── 91 Essonne ────────────────────────────────────────────
-    "https://logement.smerra.fr/ville/massy/?availability=immediat%2Ca-venir&language=fr",
-    "https://logement.smerra.fr/ville/evry-courcouronnes/?availability=immediat%2Ca-venir&language=fr",
-    # ── Paris ─────────────────────────────────────────────────
-    "https://logement.smerra.fr/ville/paris/?availability=immediat%2Ca-venir&language=fr",
+FH_SUFFIX = "?availability=immediat%2Ca-venir&language=fr"
+FH_CITIES = [
+    # 94
+    "creteil", "ivry-sur-seine", "vitry-sur-seine", "alfortville", "villejuif",
+    "maisons-alfort", "vincennes", "saint-maur-des-fosses",
+    "fontenay-sous-bois", "champigny-sur-marne",
+    # 93
+    "aubervilliers", "saint-denis", "montreuil", "pantin",
+    # 92
+    "boulogne-billancourt", "nanterre", "issy-les-moulineaux",
+    # 91
+    "massy", "evry-courcouronnes",
+    # Paris
+    "paris",
 ]
+FAC_HABITAT_PAGES = [f"https://logement.smerra.fr/ville/{c}/{FH_SUFFIX}" for c in FH_CITIES]
 
+CROUS_BASE = "https://trouverunlogement.lescrous.fr/tools/47/search?city="
 CROUS_SEARCH_PAGES = [
-    # ── 94 Val-de-Marne ───────────────────────────────────────
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Creteil",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Creteil&page=2",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Ivry-sur-Seine",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Vitry-sur-Seine",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Villejuif",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Vincennes",
-    # ── Paris ─────────────────────────────────────────────────
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris&page=2",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Paris&page=3",
-    # ── Versailles / autres ───────────────────────────────────
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Versailles",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Nanterre",
-    "https://trouverunlogement.lescrous.fr/tools/47/search?city=Massy",
+    CROUS_BASE + "Creteil",
+    CROUS_BASE + "Creteil&page=2",
+    CROUS_BASE + "Ivry-sur-Seine",
+    CROUS_BASE + "Vitry-sur-Seine",
+    CROUS_BASE + "Villejuif",
+    CROUS_BASE + "Vincennes",
+    CROUS_BASE + "Paris",
+    CROUS_BASE + "Paris&page=2",
+    CROUS_BASE + "Paris&page=3",
+    CROUS_BASE + "Versailles",
+    CROUS_BASE + "Nanterre",
+    CROUS_BASE + "Massy",
 ]
 
-# ── Technique ──────────────────────────────────────────────────
 STATE_FILE = Path(__file__).parent / "state.json"
+DEBUG_DIR = Path(__file__).parent / "debug"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9",
 }
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+DEBUG = False
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                      UTILITAIRES                            ║
 # ╚══════════════════════════════════════════════════════════════╝
 
+def pause() -> None:
+    """Petit délai aléatoire pour ne pas se faire bloquer."""
+    time.sleep(random.uniform(1, 3))
+
+
 def format_prix_ligne(price: str) -> str:
     if price in ("N/A", "", None):
         return "💶 ⚠️ Prix non récupéré — vérifier sur le site"
-    return f"💶 {price}"
+    return f"💶 {html.escape(price)}"
 
 
 def send_telegram(message: str, silent: bool = False) -> None:
@@ -111,61 +110,102 @@ def send_telegram(message: str, silent: bool = False) -> None:
         print(f"  [Telegram] ✗ Erreur : {e}")
 
 
+def send_alerts(header: str, alerts: list) -> None:
+    """Envoie les alertes en plusieurs messages si besoin (limite Telegram : 4096 car.)."""
+    chunk, size = [], len(header)
+    for a in alerts:
+        if chunk and size + len(a) + 2 > 3800:
+            send_telegram(header + "\n\n".join(chunk))
+            chunk, size = [], len(header)
+        chunk.append(a)
+        size += len(a) + 2
+    if chunk:
+        send_telegram(header + "\n\n".join(chunk))
+
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text())
-        except Exception:
-            return {}
+        except Exception as e:
+            print(f"⚠️ state.json illisible ({e}) — repartir de zéro")
     return {}
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    """Écriture atomique : pas de fichier corrompu si le script est interrompu."""
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    os.replace(tmp, STATE_FILE)
+
+
+def dump_html(name: str, content: str) -> None:
+    if not DEBUG:
+        return
+    DEBUG_DIR.mkdir(exist_ok=True)
+    safe = re.sub(r"[^a-zA-Z0-9]+", "_", name)[:80]
+    (DEBUG_DIR / f"{safe}.html").write_text(content, encoding="utf-8")
+
+
+def get(url: str) -> requests.Response:
+    r = SESSION.get(url, timeout=20)
+    r.raise_for_status()
+    return r
 
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                   SCRAPER FAC-HABITAT                       ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def parse_status_fh(text: str) -> str:
-    t = text.strip().lower()
-    if "complet" in t:
-        return "full"
-    if "venir" in t or "coming" in t:
-        return "coming_soon"
-    if "immédiate" in t or "disponible" in t or "available" in t:
-        return "available"
+def _residence_slugs(el) -> set:
+    slugs = set()
+    for a in el.find_all("a", href=True):
+        if "/residence-etudiante/" in a["href"]:
+            s = a["href"].rstrip("/").split("/")[-1]
+            if s:
+                slugs.add(s)
+    return slugs
+
+
+def _detect_status(container) -> str:
+    """Cherche un badge de statut dans le conteneur (texte court uniquement)."""
+    for el in container.find_all(string=True):
+        t = el.strip().lower()
+        if not t or len(t) > 40:
+            continue
+        if "complet" in t:
+            return "full"
+        if "venir" in t or "coming" in t:
+            return "coming_soon"
+        if "immédiat" in t or "immediat" in t or "disponible" in t or "available" in t:
+            return "available"
     return "unknown"
 
 
 def scrape_fac_habitat(url: str) -> dict:
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
+    r = get(url)
     soup = BeautifulSoup(r.text, "html.parser")
+    filtered = "availability=" in url
 
     residences = {}
-    seen = set()
 
     for link in soup.find_all("a", href=True):
         href = link["href"]
         if "/residence-etudiante/" not in href:
             continue
         slug = href.rstrip("/").split("/")[-1]
-        if not slug or slug in seen:
+        if not slug or f"fh:{slug}" in residences:
             continue
-        seen.add(slug)
 
+        # Remonter jusqu'au plus petit conteneur, sans englober d'autres résidences
         container = link
-        for _ in range(4):
-            container = container.parent
-            if container is None:
+        for _ in range(5):
+            parent = container.parent
+            if parent is None:
                 break
-            ct = container.get_text(" ", strip=True).lower()
-            if any(k in ct for k in ("complet", "immédiate", "à venir", "available")):
+            if len(_residence_slugs(parent)) > 1:
                 break
-        if container is None:
-            continue
+            container = parent
 
         name_el = (
             link.find(["h2", "h3", "h4", "strong"])
@@ -173,6 +213,7 @@ def scrape_fac_habitat(url: str) -> dict:
         )
         name = (name_el.get_text(strip=True) if name_el else link.get_text(strip=True))[:120]
         if len(name) < 4:
+            # lien "image" sans texte : on laissera un autre lien du même slug faire le travail
             continue
 
         price = "N/A"
@@ -182,15 +223,11 @@ def scrape_fac_habitat(url: str) -> dict:
                 price = t
                 break
 
-        status_raw = ""
-        for el in container.find_all(string=True):
-            t = el.strip()
-            if t.lower() in ("complet", "dispo immédiate", "dispo à venir",
-                             "disponible", "available now", "coming soon"):
-                status_raw = t
-                break
+        status = _detect_status(container)
+        if status == "unknown" and filtered:
+            # Page déjà filtrée sur dispo immédiate / à venir : présent = disponible
+            status = "available"
 
-        status = parse_status_fh(status_raw) if status_raw else "unknown"
         full_url = href if href.startswith("http") else "https://logement.smerra.fr" + href
 
         residences[f"fh:{slug}"] = {
@@ -201,6 +238,8 @@ def scrape_fac_habitat(url: str) -> dict:
             "source": "Fac-Habitat",
         }
 
+    if not residences:
+        dump_html("fh_" + url, r.text)
     return residences
 
 
@@ -209,8 +248,7 @@ def scrape_fac_habitat(url: str) -> dict:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def scrape_crous(url: str) -> dict:
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
+    r = get(url)
     soup = BeautifulSoup(r.text, "html.parser")
 
     residences = {}
@@ -226,11 +264,9 @@ def scrape_crous(url: str) -> dict:
             continue
 
         name_el = link.find("h3") or link.find("h2") or link.find("strong")
-        if name_el is None:
-            parent = link.parent
-            name_el = parent.find("h3") or parent.find("h2") if parent else None
-        name = name_el.get_text(strip=True) if name_el else f"Résidence CROUS #{accom_id}"
-        name = name[:120]
+        if name_el is None and link.parent:
+            name_el = link.parent.find("h3") or link.parent.find("h2")
+        name = (name_el.get_text(strip=True) if name_el else f"Résidence CROUS #{accom_id}")[:120]
 
         container = link.parent or link
         price = "N/A"
@@ -261,6 +297,8 @@ def scrape_crous(url: str) -> dict:
             "source": "CROUS",
         }
 
+    if not residences:
+        dump_html("crous_" + url, r.text)
     return residences
 
 
@@ -268,17 +306,17 @@ def scrape_crous(url: str) -> dict:
 # ║                   BOUCLE PRINCIPALE                         ║
 # ╚══════════════════════════════════════════════════════════════╝
 
+ICON = {"available": "✅", "coming_soon": "⏳", "full": "🔴", "unknown": "❓"}
+
+
 def check_all() -> None:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
-
-    send_telegram(
-        f"🤖 <b>Run démarré</b> — {now}",
-        silent=True,
-    )
-
-    state     = load_state()
-    new_state = dict(state)
-    alerts    = []
+    state = load_state()
+    seen: dict = {}          # tout ce qui a été vu pendant ce run
+    alerts: list = []
+    alerted: set = set()
+    all_ok = True            # False si au moins une page a échoué
+    counts = {"Fac-Habitat": 0, "CROUS": 0}
 
     # ── Fac-Habitat ───────────────────────────────────────────
     for page_url in FAC_HABITAT_PAGES:
@@ -287,35 +325,36 @@ def check_all() -> None:
             residences = scrape_fac_habitat(page_url)
         except Exception as e:
             print(f"  ✗ Erreur : {e}")
+            all_ok = False
+            pause()
             continue
 
+        counts["Fac-Habitat"] += len(residences)
         print(f"  {len(residences)} résidence(s) trouvée(s)")
 
         for key, info in residences.items():
-            prev        = state.get(key, {})
-            prev_status = prev.get("status", "unknown")
+            prev_status = state.get(key, {}).get("status", "unknown")
             curr_status = info["status"]
-            new_state[key] = info
+            seen[key] = info
+            print(f"  {ICON.get(curr_status, '?')} {info['name']} | {curr_status} | {info['price']}")
 
-            icon = {"available": "✅", "coming_soon": "⏳", "full": "🔴", "unknown": "❓"}
-            print(f"  {icon.get(curr_status,'?')} {info['name']} | {info['price']}")
-
-            if curr_status in ("available", "coming_soon") and prev_status == "full":
-                emoji = "🟢" if curr_status == "available" else "🟡"
-                label = "DISPONIBLE MAINTENANT !" if curr_status == "available" else "BIENTÔT DISPONIBLE"
+            if (
+                curr_status in ("available", "coming_soon")
+                and prev_status not in ("available", "coming_soon")
+                and key not in alerted
+            ):
+                alerted.add(key)
+                if curr_status == "available":
+                    emoji, label = "🟢", "DISPONIBLE MAINTENANT !"
+                else:
+                    emoji, label = "🟡", "BIENTÔT DISPONIBLE"
                 alerts.append(
                     f"{emoji} <b>[Fac-Habitat] {label}</b>\n"
-                    f"📍 {info['name']}\n"
+                    f"📍 {html.escape(info['name'])}\n"
                     f"{format_prix_ligne(info['price'])}\n"
-                    f"🔗 <a href=\"{info['url']}\">Voir la résidence</a>"
+                    f"🔗 <a href=\"{html.escape(info['url'])}\">Voir la résidence</a>"
                 )
-            elif curr_status == "available" and prev_status == "unknown":
-                alerts.append(
-                    f"🆕 <b>[Fac-Habitat] NOUVEAU LOGEMENT DISPONIBLE</b>\n"
-                    f"📍 {info['name']}\n"
-                    f"{format_prix_ligne(info['price'])}\n"
-                    f"🔗 <a href=\"{info['url']}\">Voir la résidence</a>"
-                )
+        pause()
 
     # ── CROUS ─────────────────────────────────────────────────
     for page_url in CROUS_SEARCH_PAGES:
@@ -324,34 +363,53 @@ def check_all() -> None:
             residences = scrape_crous(page_url)
         except Exception as e:
             print(f"  ✗ Erreur : {e}")
+            all_ok = False
+            pause()
             continue
 
+        counts["CROUS"] += len(residences)
         print(f"  {len(residences)} logement(s) trouvé(s)")
 
         for key, info in residences.items():
-            prev        = state.get(key, {})
-            prev_status = prev.get("status", "unknown")
-            new_state[key] = info
-
+            seen[key] = info
             print(f"  ✅ {info['name']} | {info['price']}")
 
-            if prev_status == "unknown":
-                addr_line = f"\n📮 {info['address']}" if info.get("address") else ""
+            if key not in state and key not in alerted:
+                alerted.add(key)
+                addr_line = f"\n📮 {html.escape(info['address'])}" if info.get("address") else ""
                 alerts.append(
                     f"🏛️ <b>[CROUS] NOUVEAU LOGEMENT DISPONIBLE</b>\n"
-                    f"📍 {info['name']}{addr_line}\n"
+                    f"📍 {html.escape(info['name'])}{addr_line}\n"
                     f"{format_prix_ligne(info['price'])}\n"
-                    f"🔗 <a href=\"{info['url']}\">Voir le logement</a>"
+                    f"🔗 <a href=\"{html.escape(info['url'])}\">Voir le logement</a>"
                 )
+        pause()
 
+    # ── Mise à jour de l'état ─────────────────────────────────
+    if all_ok:
+        # Tout a été scrapé : on ne garde que ce qui est encore visible,
+        # ainsi un logement qui disparaît puis revient re-déclenche une alerte.
+        new_state = seen
+    else:
+        # Une page a échoué : on conserve l'ancien état pour éviter de fausses alertes
+        new_state = {**state, **seen}
     save_state(new_state)
 
+    # ── Alertes ───────────────────────────────────────────────
     if alerts:
-        header = f"🏠 <b>Alerte logement étudiant</b> ({now})\n\n"
-        send_telegram(header + "\n\n".join(alerts))
+        send_alerts(f"🏠 <b>Alerte logement étudiant</b> ({now})\n\n", alerts)
         print(f"\n→ {len(alerts)} alerte(s) Telegram envoyée(s) !")
     else:
         print(f"\n[{now}] Aucun nouveau logement détecté.")
+
+    # Avertissement silencieux si un site ne renvoie plus rien (structure changée ?)
+    for source, n in counts.items():
+        if n == 0:
+            send_telegram(
+                f"⚠️ {source} : 0 résultat sur toutes les pages ({now}). "
+                f"Le site a peut-être changé ou bloque le script.",
+                silent=True,
+            )
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -359,22 +417,36 @@ def check_all() -> None:
 # ╚══════════════════════════════════════════════════════════════╝
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Surveille Fac-Habitat + CROUS IDF"
-    )
-    parser.add_argument(
-        "--loop", type=int, default=0, metavar="MINUTES",
-        help="Intervalle entre les vérifications (0 = une seule fois)"
-    )
+    global DEBUG
+    parser = argparse.ArgumentParser(description="Surveille Fac-Habitat + CROUS IDF")
+    parser.add_argument("--loop", type=int, default=0, metavar="MINUTES",
+                        help="Intervalle entre les vérifications (0 = une seule fois)")
+    parser.add_argument("--reset", action="store_true", help="Supprime state.json au démarrage")
+    parser.add_argument("--debug", action="store_true",
+                        help="Sauvegarde le HTML des pages qui renvoient 0 résultat dans ./debug")
     args = parser.parse_args()
+    DEBUG = args.debug
+
+    if args.reset and STATE_FILE.exists():
+        STATE_FILE.unlink()
+        print("🧹 state.json supprimé")
 
     print("🔍 Démarrage — toutes les résidences alertées, sans filtre de prix")
     print(f"   Sources : Fac-Habitat ({len(FAC_HABITAT_PAGES)} pages) + CROUS ({len(CROUS_SEARCH_PAGES)} pages)\n")
 
+    # Message de démarrage envoyé UNE seule fois
+    send_telegram(
+        f"🤖 <b>Surveillance lancée</b> — {datetime.now():%d/%m/%Y %H:%M}",
+        silent=True,
+    )
+
     if args.loop > 0:
         print(f"🔄 Boucle : toutes les {args.loop} min. Ctrl+C pour arrêter.\n")
         while True:
-            check_all()
+            try:
+                check_all()
+            except Exception as e:
+                print(f"✗ Erreur inattendue : {e}")
             time.sleep(args.loop * 60)
     else:
         check_all()
