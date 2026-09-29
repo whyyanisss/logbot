@@ -19,6 +19,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,21 +48,12 @@ FH_CITIES = [
 ]
 FAC_HABITAT_PAGES = [f"https://logement.smerra.fr/ville/{c}/{FH_SUFFIX}" for c in FH_CITIES]
 
-CROUS_BASE = "https://trouverunlogement.lescrous.fr/tools/47/search?city="
-CROUS_SEARCH_PAGES = [
-    CROUS_BASE + "Creteil",
-    CROUS_BASE + "Creteil&page=2",
-    CROUS_BASE + "Ivry-sur-Seine",
-    CROUS_BASE + "Vitry-sur-Seine",
-    CROUS_BASE + "Villejuif",
-    CROUS_BASE + "Vincennes",
-    CROUS_BASE + "Paris",
-    CROUS_BASE + "Paris&page=2",
-    CROUS_BASE + "Paris&page=3",
-    CROUS_BASE + "Versailles",
-    CROUS_BASE + "Nanterre",
-    CROUS_BASE + "Massy",
-]
+# Le paramètre ?city= du CROUS est ignoré par le site (il renvoie toute la France).
+# On récupère donc toutes les pages et on filtre nous-mêmes sur l'Île-de-France
+# d'après le code postal. Le "47" est l'identifiant de la campagne 2026-2027 :
+# il changera à la prochaine rentrée.
+CROUS_SEARCH_URL = "https://trouverunlogement.lescrous.fr/tools/47/search"
+IDF_DEPTS = ("75", "77", "78", "91", "92", "93", "94", "95")
 
 STATE_FILE = Path(__file__).parent / "state.json"
 DEBUG_DIR = Path(__file__).parent / "debug"
@@ -91,6 +83,10 @@ def format_prix_ligne(price: str) -> str:
     if price in ("N/A", "", None):
         return "💶 ⚠️ Prix non récupéré — vérifier sur le site"
     return f"💶 {html.escape(price)}"
+
+
+def addr_line(info: dict) -> str:
+    return f"\n📮 {html.escape(info['address'])}" if info.get("address") else ""
 
 
 def send_telegram(message: str, silent: bool = False) -> None:
@@ -216,12 +212,12 @@ def scrape_fac_habitat(url: str) -> dict:
             # lien "image" sans texte : on laissera un autre lien du même slug faire le travail
             continue
 
-        price = "N/A"
-        for el in container.find_all(string=True):
-            t = el.strip()
-            if "€" in t and "partir" in t.lower():
-                price = t
-                break
+        text = container.get_text(" ", strip=True)
+        m = re.search(r"partir\s+de\s*([\d\s.,]+?)\s*€", text, re.I)
+        price = f"À partir de {m.group(1).strip()}€" if m else "N/A"
+
+        link_text = link.get_text(" ", strip=True)
+        address = link_text[len(name):].strip(" ,") if link_text.startswith(name) else ""
 
         status = _detect_status(container)
         if status == "unknown" and filtered:
@@ -234,6 +230,7 @@ def scrape_fac_habitat(url: str) -> dict:
             "name": name,
             "url": full_url,
             "price": price,
+            "address": address,
             "status": status,
             "source": "Fac-Habitat",
         }
@@ -247,59 +244,71 @@ def scrape_fac_habitat(url: str) -> dict:
 # ║                     SCRAPER CROUS                           ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-def scrape_crous(url: str) -> dict:
-    r = get(url)
-    soup = BeautifulSoup(r.text, "html.parser")
-
+def scrape_crous():
+    """Parcourt toutes les pages de résultats et garde les logements d'Île-de-France.
+    Retourne (logements_IDF, total_toutes_regions)."""
     residences = {}
+    total = 0
+    url = CROUS_SEARCH_URL
+    visited = set()
 
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-        if "/accommodations/" not in href:
-            continue
+    for _ in range(15):  # garde-fou
+        if url in visited:
+            break
+        visited.add(url)
+        r = get(url)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        accom_id = href.rstrip("/").split("/")[-1]
-        key = f"crous:{accom_id}"
-        if key in residences:
-            continue
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
+            if "/accommodations/" not in href:
+                continue
+            accom_id = href.rstrip("/").split("/")[-1]
+            key = f"crous:{accom_id}"
+            if key in residences:
+                continue
 
-        name_el = link.find("h3") or link.find("h2") or link.find("strong")
-        if name_el is None and link.parent:
-            name_el = link.parent.find("h3") or link.parent.find("h2")
-        name = (name_el.get_text(strip=True) if name_el else f"Résidence CROUS #{accom_id}")[:120]
+            card = link.find_parent("li") or link.parent
+            total += 1
 
-        container = link.parent or link
-        price = "N/A"
-        for el in container.find_all(string=True):
-            t = el.strip()
-            if "€" in t and re.search(r"\d", t):
-                price = t
+            name = link.get_text(strip=True)[:120] or f"Résidence CROUS #{accom_id}"
+            text = card.get_text("\n", strip=True)
+
+            # Adresse : ligne contenant un code postal à 5 chiffres
+            addr, dept = "", ""
+            for line in text.split("\n"):
+                pm = re.search(r"\b(\d{5})\b", line)
+                if pm and "€" not in line:
+                    addr, dept = line.strip(" -"), pm.group(1)[:2]
+                    break
+            if dept not in IDF_DEPTS:
+                continue
+
+            pm = re.search(r"((?:de\s*)?[\d.,]+(?:\s*à\s*[\d.,]+)?\s*€)", text)
+            price = pm.group(1).strip() if pm else "N/A"
+
+            residences[key] = {
+                "name": name,
+                "url": urljoin(url, href),
+                "price": price,
+                "address": addr,
+                "status": "available",
+                "source": "CROUS",
+            }
+        pause()
+
+        nxt = None
+        for a in soup.find_all("a", href=True):
+            if "suivante" in a.get_text().lower():
+                nxt = urljoin(url, a["href"])
                 break
+        if not nxt:
+            break
+        url = nxt
 
-        addr = ""
-        for el in container.find_all(string=True):
-            t = el.strip()
-            if re.match(r"^\d+[,\s]", t) and len(t) > 10:
-                addr = t
-                break
-
-        full_url = (
-            href if href.startswith("http")
-            else "https://trouverunlogement.lescrous.fr" + href
-        )
-
-        residences[key] = {
-            "name": name,
-            "url": full_url,
-            "price": price,
-            "address": addr,
-            "status": "available",
-            "source": "CROUS",
-        }
-
-    if not residences:
-        dump_html("crous_" + url, r.text)
-    return residences
+    if total == 0:
+        dump_html("crous_search", r.text)
+    return residences, total
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -350,40 +359,34 @@ def check_all() -> None:
                     emoji, label = "🟡", "BIENTÔT DISPONIBLE"
                 alerts.append(
                     f"{emoji} <b>[Fac-Habitat] {label}</b>\n"
-                    f"📍 {html.escape(info['name'])}\n"
+                    f"📍 {html.escape(info['name'])}{addr_line(info)}\n"
                     f"{format_prix_ligne(info['price'])}\n"
                     f"🔗 <a href=\"{html.escape(info['url'])}\">Voir la résidence</a>"
                 )
         pause()
 
     # ── CROUS ─────────────────────────────────────────────────
-    for page_url in CROUS_SEARCH_PAGES:
-        print(f"\n[CROUS] {page_url}")
-        try:
-            residences = scrape_crous(page_url)
-        except Exception as e:
-            print(f"  ✗ Erreur : {e}")
-            all_ok = False
-            pause()
-            continue
-
-        counts["CROUS"] += len(residences)
-        print(f"  {len(residences)} logement(s) trouvé(s)")
+    print(f"\n[CROUS] {CROUS_SEARCH_URL} (toutes pages, filtre Île-de-France)")
+    try:
+        residences, total = scrape_crous()
+        counts["CROUS"] = total
+        print(f"  {total} logement(s) en France, {len(residences)} en Île-de-France")
 
         for key, info in residences.items():
             seen[key] = info
-            print(f"  ✅ {info['name']} | {info['price']}")
+            print(f"  ✅ {info['name']} | {info['price']} | {info['address']}")
 
             if key not in state and key not in alerted:
                 alerted.add(key)
-                addr_line = f"\n📮 {html.escape(info['address'])}" if info.get("address") else ""
                 alerts.append(
                     f"🏛️ <b>[CROUS] NOUVEAU LOGEMENT DISPONIBLE</b>\n"
-                    f"📍 {html.escape(info['name'])}{addr_line}\n"
+                    f"📍 {html.escape(info['name'])}{addr_line(info)}\n"
                     f"{format_prix_ligne(info['price'])}\n"
                     f"🔗 <a href=\"{html.escape(info['url'])}\">Voir le logement</a>"
                 )
-        pause()
+    except Exception as e:
+        print(f"  ✗ Erreur : {e}")
+        all_ok = False
 
     # ── Mise à jour de l'état ─────────────────────────────────
     if all_ok:
@@ -432,7 +435,7 @@ def main():
         print("🧹 state.json supprimé")
 
     print("🔍 Démarrage — toutes les résidences alertées, sans filtre de prix")
-    print(f"   Sources : Fac-Habitat ({len(FAC_HABITAT_PAGES)} pages) + CROUS ({len(CROUS_SEARCH_PAGES)} pages)\n")
+    print(f"   Sources : Fac-Habitat ({len(FAC_HABITAT_PAGES)} pages) + CROUS (toutes pages, filtre IDF)\n")
 
     # Message de démarrage envoyé UNE seule fois
     send_telegram(
